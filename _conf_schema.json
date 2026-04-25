@@ -1,0 +1,171 @@
+{
+  "api_type": {
+    "description": "API 类型",
+    "type": "string",
+    "hint": "选择使用的 API 类型：moderation 为专用审核 API，openai_vision 为 OpenAI 兼容的视觉 API",
+    "default": "openai_vision",
+    "options": ["openai_vision", "moderation"]
+  },
+  "api_endpoint": {
+    "description": "API 站点地址",
+    "type": "string",
+    "hint": "OpenAI Vision: 填写 chat/completions 端点，如 https://api.openai.com/v1/chat/completions；Moderation: 填写审核 API 地址",
+    "default": ""
+  },
+  "api_key": {
+    "description": "API Key",
+    "type": "string",
+    "hint": "API 密钥，用于认证请求",
+    "default": ""
+  },
+  "model_name": {
+    "description": "模型名称",
+    "type": "string",
+    "hint": "OpenAI Vision 模型名称，如 gpt-4o、gpt-4-vision-preview、claude-3-opus 等",
+    "default": "gpt-4o"
+  },
+  "detection_prompt": {
+    "description": "检测提示词",
+    "type": "text",
+    "hint": "发送给视觉 AI 的提示词，用于指导 AI 检测违规内容",
+    "default": "请分析这张图片，判断是否包含以下违规内容：\n1. 色情内容：裸露、性行为、性暗示等\n2. 擦边内容：过于暴露、挑逗姿势、暗示性服装等\n\n请以 JSON 格式回复，格式如下：\n{\"is_violation\": true/false, \"type\": \"porn/sexy/normal\", \"confidence\": 0.0-1.0, \"reason\": \"简短说明原因\"}\n\n只返回 JSON，不要其他内容。"
+  },
+  "ban_duration": {
+    "description": "图片违规禁言时长（秒）",
+    "type": "int",
+    "hint": "检测到违规图片后的禁言时长，默认 600 秒（10分钟）",
+    "default": 600
+  },
+  "spam_ban_duration": {
+    "description": "刷屏禁言时长（秒）",
+    "type": "int",
+    "hint": "检测到刷屏后的禁言时长，默认 600 秒（10分钟）",
+    "default": 600
+  },
+  "spam_check_enabled": {
+    "description": "启用刷屏检测",
+    "type": "bool",
+    "hint": "是否启用刷屏检测功能",
+    "default": true
+  },
+  "spam_threshold": {
+    "description": "刷屏阈值（消息数）",
+    "type": "int",
+    "hint": "在指定时间内发送超过此数量的消息视为刷屏",
+    "default": 5
+  },
+  "spam_time_window": {
+    "description": "刷屏检测时间窗口（秒）",
+    "type": "int",
+    "hint": "检测刷屏的时间窗口，默认 10 秒",
+    "default": 10
+  },
+  "profanity_check_enabled": {
+    "description": "启用骂人检测",
+    "type": "bool",
+    "hint": "是否启用骂人检测功能",
+    "default": true
+  },
+  "profanity_use_ai": {
+    "description": "使用AI检测骂人",
+    "type": "bool",
+    "hint": "是否使用AI检测骂人内容，关闭则使用关键词匹配",
+    "default": true
+  },
+  "profanity_ban_duration": {
+    "description": "骂人禁言时长（秒）",
+    "type": "int",
+    "hint": "检测到骂人后的禁言时长，默认 600 秒（10分钟）",
+    "default": 600
+  },
+  "profanity_keywords": {
+    "description": "骂人关键词列表（备用）",
+    "type": "list",
+    "hint": "AI检测失败时使用的关键词列表",
+    "default": ["傻逼", "操你妈", "妈的", "他妈的", "草你妈", "艹你妈", "你妈死了", "去你妈的", "狗日的", "王八蛋", "畜生", "杂种", "贱人", "婊子"]
+  },
+  "ad_check_enabled": {
+    "description": "启用广告检测",
+    "type": "bool",
+    "hint": "是否启用广告检测功能",
+    "default": true
+  },
+  "ad_ban_duration": {
+    "description": "广告禁言时长（秒）",
+    "type": "int",
+    "hint": "检测到广告后的禁言时长，默认 600 秒（10分钟）",
+    "default": 600
+  },
+  "ad_keywords": {
+    "description": "广告关键词列表",
+    "type": "list",
+    "hint": "广告关键词列表，检测到这些词会触发禁言",
+    "default": ["加群", "加微信", "加QQ", "联系我", "私聊", "代练", "代打", "刷钻", "刷币", "外挂", "辅助", "出售", "转让", "低价", "优惠", "促销", "折扣", "代购", "微商", "兼职", "赚钱", "日赚", "月入", "进群"]
+  },
+  "group_promotion_check_enabled": {
+    "description": "启用群号推广检测",
+    "type": "bool",
+    "hint": "检测群号推广行为（如：进群；12345678）",
+    "default": true
+  },
+  "group_promotion_ban_duration": {
+    "description": "群号推广禁言时长（秒）",
+    "type": "int",
+    "hint": "检测到群号推广后的禁言时长，默认 600 秒（10分钟）",
+    "default": 600
+  },
+  "link_check_enabled": {
+    "description": "启用链接检测",
+    "type": "bool",
+    "hint": "是否启用链接检测功能",
+    "default": false
+  },
+  "link_ban_duration": {
+    "description": "链接禁言时长（秒）",
+    "type": "int",
+    "hint": "检测到链接后的禁言时长，默认 600 秒（10分钟）",
+    "default": 600
+  },
+  "whitelist_users": {
+    "description": "白名单用户列表",
+    "type": "list",
+    "hint": "白名单用户QQ号列表，这些用户不受检测限制",
+    "default": []
+  },
+  "threshold": {
+    "description": "检测阈值",
+    "type": "float",
+    "hint": "违规判定阈值（0-1），AI 返回的置信度超过此值才判定为违规",
+    "default": 0.7
+  },
+  "enabled_groups": {
+    "description": "监控群组列表",
+    "type": "list",
+    "hint": "需要监控的群号列表，留空表示监控所有群组",
+    "default": []
+  },
+  "check_porn": {
+    "description": "检测色情内容",
+    "type": "bool",
+    "hint": "是否检测色情类违规图片",
+    "default": true
+  },
+  "check_sexy": {
+    "description": "检测擦边内容",
+    "type": "bool",
+    "hint": "是否检测擦边类违规图片",
+    "default": true
+  },
+  "notify_on_violation": {
+    "description": "违规时发送通知",
+    "type": "bool",
+    "hint": "检测到违规时是否在群里发送通知消息",
+    "default": true
+  },
+  "admin_bypass": {
+    "description": "管理员豁免",
+    "type": "bool",
+    "hint": "管理员发送的图片是否跳过检测",
+    "default": true
+  }
+}
