@@ -22,7 +22,10 @@ class ImageModerationPlugin(Star):
         logger.info("[群违规检测] 插件初始化完成")
         api_type = self.config.get("api_type", "openai_vision")
         logger.info(f"[群违规检测] API类型: {api_type}")
-        logger.info(f"[群违规检测] API站点: {self.config.get('api_endpoint', '未配置')}")
+        if api_type == "ollama":
+            logger.info(f"[群违规检测] Ollama地址: {self.config.get('ollama_host', 'http://localhost:11434')}")
+        else:
+            logger.info(f"[群违规检测] API站点: {self.config.get('api_endpoint', '未配置')}")
         logger.info(f"[群违规检测] 模型: {self.config.get('model_name', 'gpt-4o')}")
         logger.info(f"[群违规检测] 监控群组: {self.config.get('enabled_groups', '全部')}")
         logger.info(f"[群违规检测] 图片违规禁言: {self.config.get('ban_duration', 600)} 秒")
@@ -39,7 +42,7 @@ class ImageModerationPlugin(Star):
         logger.info(f"[群违规检测] 白名单用户: {len(self.config.get('whitelist_users', []))} 人")
         logger.warning("[群违规检测] [警告] 重要提示：机器人需要有群管理员权限才能撤回消息和禁言用户！")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+@filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
         group_id = event.get_group_id()
         if not group_id:
@@ -111,7 +114,7 @@ class ImageModerationPlugin(Star):
         api_key = self.config.get("api_key", "")
         api_type = self.config.get("api_type", "openai_vision")
 
-        if not api_endpoint:
+        if api_type != "ollama" and not api_endpoint:
             logger.warning("[群违规检测] API站点未配置，请前往管理面板配置")
             return False, ""
 
@@ -131,6 +134,8 @@ class ImageModerationPlugin(Star):
 
             if api_type == "openai_vision":
                 return await self._check_with_openai_vision(api_endpoint, api_key, image_base64)
+            elif api_type == "ollama":
+                return await self._check_with_ollama(image_base64)
             else:
                 return await self._check_with_moderation_api(api_endpoint, api_key, image_base64)
 
@@ -194,6 +199,98 @@ class ImageModerationPlugin(Star):
                 logger.info(f"[群违规检测] API 响应成功，开始解析结果...")
                 return self._parse_openai_response(result)
 
+    async def _check_with_ollama(self, image_base64: str) -> tuple[bool, str]:
+        ollama_host = self.config.get("ollama_host", "http://localhost:11434")
+        model_name = self.config.get("model_name", "llava")
+        detection_prompt = self.config.get("detection_prompt", self._get_default_prompt())
+
+        logger.info(f"[群违规检测] 使用Ollama模型: {model_name}")
+
+        payload = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": detection_prompt,
+                    "images": [image_base64]
+                }
+            ],
+            "stream": False
+        }
+
+        api_endpoint = f"{ollama_host}/api/chat"
+        logger.info(f"[群违规检测] 发送 Ollama 请求到: {api_endpoint}")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                api_endpoint,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"[群违规检测] Ollama API请求失败: {response.status} - {error_text}")
+                    return False, ""
+
+                result = await response.json()
+                logger.info(f"[群违规检测] Ollama 响应成功，开始解析结果...")
+                return self._parse_ollama_response(result)
+
+    def _parse_ollama_response(self, result: dict) -> tuple[bool, str]:
+        try:
+            content = result.get("message", {}).get("content", "")
+            logger.info(f"[群违规检测] Ollama 原始响应: {content}")
+
+            content = content.strip()
+            if content.startswith("```"):
+                lines = content.split('\n')
+                content = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
+                logger.info(f"[群违规检测] 移除markdown代码块后: {content}")
+
+            json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                logger.info(f"[群违规检测] 提取的 JSON: {json_str}")
+                data = json.loads(json_str)
+            else:
+                logger.warning(f"[群违规检测] 未找到 JSON 格式，尝试直接解析")
+                data = json.loads(content)
+
+            is_violation = data.get("is_violation", False)
+            violation_type = data.get("type", "normal").lower()
+            confidence = float(data.get("confidence", 0))
+            reason = data.get("reason", "")
+
+            logger.info(f"[群违规检测] 解析结果 - 类型: {violation_type}, 置信度: {confidence:.0%}, 违规: {is_violation}, 原因: {reason}")
+
+            threshold = self.config.get("threshold", 0.7)
+            check_porn = self.config.get("check_porn", True)
+            check_sexy = self.config.get("check_sexy", True)
+
+            logger.info(f"[群违规检测] 判断条件 - 阈值: {threshold}, 检测色情: {check_porn}, 检测擦边: {check_sexy}")
+
+            if is_violation and confidence >= threshold:
+                if violation_type == "porn" and check_porn:
+                    logger.warning(f"[群违规检测] [警告] 检测到色情内容！置信度: {confidence:.0%}")
+                    return True, f"检测到色情内容 (置信度: {confidence:.0%}) - {reason}"
+                elif violation_type == "sexy" and check_sexy:
+                    logger.warning(f"[群违规检测] [警告] 检测到擦边内容！置信度: {confidence:.0%}")
+                    return True, f"检测到擦边内容 (置信度: {confidence:.0%}) - {reason}"
+                else:
+                    logger.info(f"[群违规检测] 违规类型 {violation_type} 未启用检测或置信度不足")
+
+            logger.info(f"[群违规检测] [通过] 图片审核通过，未检测到违规内容")
+            return False, ""
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[群违规检测] JSON 解析失败: {e}, 原始内容: {content}")
+            return False, ""
+        except Exception as e:
+            logger.error(f"[群违规检测] 解析 Ollama 响应失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False, ""
+
     async def _check_with_moderation_api(self, api_endpoint: str, api_key: str, image_base64: str) -> tuple[bool, str]:
         payload = {
             "input": image_base64
@@ -221,35 +318,7 @@ class ImageModerationPlugin(Star):
                 return self._parse_moderation_response(result)
 
     def _get_default_prompt(self) -> str:
-        return """你是一个极其严格的内容审核助手。请仔细分析这张图片，判断是否包含以下违规内容：
-
-【色情内容（porn）】- 必须判定为违规：
-- 任何形式的裸露（包括但不限于：胸部、臀部、生殖器的任何暴露）
-- 性暗示动作或姿势
-- 过度暴露的服装（比基尼、内衣、泳装等）
-- 任何性感挑逗的表情或动作
-
-【擦边内容（sexy）】- 必须判定为违规：
-- 暴露的服装（低胸、短裙、露背等）
-- 性感姿势或表情
-- 暗示性的身体接触
-- 任何可能引起不适的暴露内容
-
-【重要判断标准】：
-1. **不管什么风格**（卡通、动漫、真人等），只要暴露就是违规
-2. **宁可误判也不要漏判**，保护用户安全是第一位的
-3. 只要穿着暴露、姿势性感，就必须判定为违规
-4. 不要被"卡通风格"、"可爱风格"迷惑，暴露就是违规
-
-请以严格的 JSON 格式回复（不要添加任何其他文字、不要用markdown代码块）：
-{"is_violation": true, "type": "porn", "confidence": 0.95, "reason": "检测到暴露内容"}
-
-注意：
-- is_violation 必须是 true 或 false（布尔值，不要加引号）
-- type 只能是 "porn"、"sexy" 或 "normal" 之一
-- confidence 必须是 0.0 到 1.0 之间的数字（如果确定违规，confidence 应该 >= 0.8）
-- reason 简要说明违规原因
-- **如果图片中有任何暴露内容，is_violation 必须为 true**"""
+        return """你是一个极其严格的内容审核助手。请仔细分析这张图片，判断是否包含以下违规内容： 【色情内容（porn）】- 必须判定为违规： - 任何形式的裸露（包括但不限于：胸部、臀部、生殖器的任何暴露） - 性暗示动作或姿势 - 过度暴露的服装（比基尼、内衣、泳装等） - 任何性感挑逗的表情或动作 【擦边内容（sexy）】- 必须判定为违规： - 暴露的服装（低胸、短裙、露背等） - 性感姿势或表情 - 暗示性的身体接触 - 任何可能引起不适的暴露内容 【重要判断标准】： 1. **不管什么风格**（卡通、动漫、真人等），只要暴露就是违规 2. **宁可误判也不要漏判**，保护用户安全是第一位的 3. 只要穿着暴露、姿势性感，就必须判定为违规 4. 不要被"卡通风格"、"可爱风格"迷惑，暴露就是违规 请以严格的 JSON 格式回复（不要添加任何其他文字、不要用markdown代码块）： {"is_violation": true, "type": "porn", "confidence": 0.95, "reason": "检测到暴露内容"} 注意： - is_violation 必须是 true 或 false（布尔值，不要加引号） - type 只能是 "porn"、"sexy" 或 "normal" 之一 - confidence 必须是 0.0 到 1.0 之间的数字（如果确定违规，confidence 应该 >= 0.8） - reason 简要说明违规原因 - **如果图片中有任何暴露内容，is_violation 必须为 true**"""
 
     def _parse_openai_response(self, result: dict) -> tuple[bool, str]:
         try:
@@ -376,10 +445,11 @@ class ImageModerationPlugin(Star):
         profanity_use_ai = self.config.get("profanity_use_ai", True)
         
         if profanity_use_ai:
+            api_type = self.config.get("api_type", "openai_vision")
             api_endpoint = self.config.get("api_endpoint", "")
             api_key = self.config.get("api_key", "")
             
-            if api_endpoint:
+            if api_type == "ollama" or api_endpoint:
                 logger.info(f"[群违规检测] 使用AI检测骂人内容...")
                 try:
                     is_profanity, reason = await self._check_profanity_with_ai(api_endpoint, api_key, message_text)
@@ -410,48 +480,50 @@ class ImageModerationPlugin(Star):
         return False
 
     async def _check_profanity_with_ai(self, api_endpoint: str, api_key: str, message_text: str) -> tuple[bool, str]:
+        api_type = self.config.get("api_type", "openai_vision")
         model_name = self.config.get("model_name", "gpt-4o")
         
-        prompt = """你是一个严格的内容审核助手。请判断以下文本是否包含骂人、侮辱、人身攻击等不当内容。
+        prompt = """你是一个严格的内容审核助手。请判断以下文本是否包含骂人、侮辱、人身攻击等不当内容。 判断标准： 1. 包含脏话、粗口、侮辱性词汇 2. 对他人进行人身攻击 3. 使用侮辱性称呼 4. 含有恶意攻击性语言 请以严格的 JSON 格式回复（不要添加任何其他文字）： {"is_profanity": true, "reason": "包含侮辱性词汇"} 注意： - is_profanity 必须是 true 或 false（布尔值，不要加引号） - reason 简要说明原因 - 宁可误判也不要漏判，保护群聊环境"""
 
-判断标准：
-1. 包含脏话、粗口、侮辱性词汇
-2. 对他人进行人身攻击
-3. 使用侮辱性称呼
-4. 含有恶意攻击性语言
-
-请以严格的 JSON 格式回复（不要添加任何其他文字）：
-{"is_profanity": true, "reason": "包含侮辱性词汇"}
-
-注意：
-- is_profanity 必须是 true 或 false（布尔值，不要加引号）
-- reason 简要说明原因
-- 宁可误判也不要漏判，保护群聊环境"""
-
-        payload = {
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": f"{prompt}\n\n待检测文本：{message_text}"
-                }
-            ],
-            "max_tokens": 200,
-            "temperature": 0.1
-        }
+        if api_type == "ollama":
+            ollama_host = self.config.get("ollama_host", "http://localhost:11434")
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"{prompt}\n\n待检测文本：{message_text}"
+                    }
+                ],
+                "stream": False
+            }
+            api_url = f"{ollama_host}/api/chat"
+        else:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"{prompt}\n\n待检测文本：{message_text}"
+                    }
+                ],
+                "max_tokens": 200,
+                "temperature": 0.1
+            }
+            api_url = api_endpoint
 
         headers = {
             "Content-Type": "application/json",
         }
-        if api_key:
+        if api_type != "ollama" and api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                api_endpoint,
+                api_url,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -459,7 +531,10 @@ class ImageModerationPlugin(Star):
                     return False, ""
 
                 result = await response.json()
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if api_type == "ollama":
+                    content = result.get("message", {}).get("content", "")
+                else:
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
                 logger.info(f"[群违规检测] AI骂人检测响应: {content}")
 
                 try:
@@ -899,7 +974,7 @@ class ImageModerationPlugin(Star):
             import traceback
             logger.error(traceback.format_exc())
 
-    @filter.command("群违规检测状态")
+@filter.command("群违规检测状态")
     async def status_command(self, event: AstrMessageEvent):
         api_type = self.config.get("api_type", "openai_vision")
         ban_minutes = self.config.get("ban_duration", 600)
@@ -913,38 +988,16 @@ class ImageModerationPlugin(Star):
         profanity_use_ai = self.config.get("profanity_use_ai", True)
         profanity_mode = "AI检测" if profanity_use_ai else "关键词检测"
         whitelist_users = self.config.get("whitelist_users", [])
-        status_info = f"""群违规检测插件状态:
-API类型: {api_type}
-API站点: {self.config.get('api_endpoint', '未配置')}
-API Key: {'已配置' if self.config.get('api_key') else '未配置'}
-模型名称: {self.config.get('model_name', 'gpt-4o')}
-
-【禁言时长】
-图片违规: {ban_minutes} 秒
-刷屏: {spam_ban_seconds} 秒
-骂人: {profanity_ban_seconds} 秒
-广告: {ad_ban_seconds} 秒
-链接: {link_ban_seconds} 秒
-群号推广: {group_promotion_ban_seconds} 秒
-
-【检测功能】
-图片检测: {'开启' if self.config.get('check_porn', True) or self.config.get('check_sexy', True) else '关闭'}
-刷屏检测: {'开启' if self.config.get('spam_check_enabled', True) else '关闭'} (阈值: {self.config.get('spam_threshold', 5)} 条/{self.config.get('spam_time_window', 10)} 秒)
-骂人检测: {'开启' if self.config.get('profanity_check_enabled', True) else '关闭'} (模式: {profanity_mode}, 关键词: {len(profanity_keywords)} 个)
-广告检测: {'开启' if self.config.get('ad_check_enabled', True) else '关闭'} (关键词: {len(ad_keywords)} 个)
-链接检测: {'开启' if self.config.get('link_check_enabled', False) else '关闭'}
-群号推广检测: {'开启' if self.config.get('group_promotion_check_enabled', True) else '关闭'}
-
-【其他设置】
-监控群组: {self.config.get('enabled_groups', '全部') or '全部'}
-白名单用户: {len(whitelist_users)} 人
-管理员豁免: {'开启' if self.config.get('admin_bypass', True) else '关闭'}
-违规通知: {'开启' if self.config.get('notify_on_violation', True) else '关闭'}
-
-请在管理面板修改配置"""
+        
+        if api_type == "ollama":
+            api_info = f"""API类型: {api_type} (本地) Ollama地址: {self.config.get('ollama_host', 'http://localhost:11434')} 模型名称: {self.config.get('model_name', 'llava')}"""
+        else:
+            api_info = f"""API类型: {api_type} API站点: {self.config.get('api_endpoint', '未配置')} API Key: {'已配置' if self.config.get('api_key') else '未配置'} 模型名称: {self.config.get('model_name', 'gpt-4o')}"""
+        
+        status_info = f"""群违规检测插件状态: {api_info} 【禁言时长】 图片违规: {ban_minutes} 秒 刷屏: {spam_ban_seconds} 秒 骂人: {profanity_ban_seconds} 秒 广告: {ad_ban_seconds} 秒 链接: {link_ban_seconds} 秒 群号推广: {group_promotion_ban_seconds} 秒 【检测功能】 图片检测: {'开启' if self.config.get('check_porn', True) or self.config.get('check_sexy', True) else '关闭'} 刷屏检测: {'开启' if self.config.get('spam_check_enabled', True) else '关闭'} (阈值: {self.config.get('spam_threshold', 5)} 条/{self.config.get('spam_time_window', 10)} 秒) 骂人检测: {'开启' if self.config.get('profanity_check_enabled', True) else '关闭'} (模式: {profanity_mode}, 关键词: {len(profanity_keywords)} 个) 广告检测: {'开启' if self.config.get('ad_check_enabled', True) else '关闭'} (关键词: {len(ad_keywords)} 个) 链接检测: {'开启' if self.config.get('link_check_enabled', False) else '关闭'} 群号推广检测: {'开启' if self.config.get('group_promotion_check_enabled', True) else '关闭'} 【其他设置】 监控群组: {self.config.get('enabled_groups', '全部') or '全部'} 白名单用户: {len(whitelist_users)} 人 管理员豁免: {'开启' if self.config.get('admin_bypass', True) else '关闭'} 违规通知: {'开启' if self.config.get('notify_on_violation', True) else '关闭'} 请在管理面板修改配置"""
         yield event.plain_result(status_info)
 
-    @filter.command("设置图片禁言时长")
+@filter.command("设置图片禁言时长")
     async def set_image_ban_duration(self, event: AstrMessageEvent, seconds: int):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
@@ -953,7 +1006,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["ban_duration"] = seconds
         yield event.plain_result(f"[成功] 图片违规禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置刷屏禁言时长")
+@filter.command("设置刷屏禁言时长")
     async def set_spam_ban_duration(self, event: AstrMessageEvent, seconds: int):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
@@ -962,7 +1015,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["spam_ban_duration"] = seconds
         yield event.plain_result(f"[成功] 刷屏禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置骂人禁言时长")
+@filter.command("设置骂人禁言时长")
     async def set_profanity_ban_duration(self, event: AstrMessageEvent, seconds: int):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
@@ -971,7 +1024,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["profanity_ban_duration"] = seconds
         yield event.plain_result(f"[成功] 骂人禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("添加骂人关键词")
+@filter.command("添加骂人关键词")
     async def add_profanity_keyword(self, event: AstrMessageEvent, keyword: str):
         profanity_keywords = self.config.get("profanity_keywords", [])
         
@@ -983,7 +1036,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["profanity_keywords"] = profanity_keywords
         yield event.plain_result(f"[成功] 已添加关键词 '{keyword}'\n当前关键词数量: {len(profanity_keywords)}")
 
-    @filter.command("删除骂人关键词")
+@filter.command("删除骂人关键词")
     async def remove_profanity_keyword(self, event: AstrMessageEvent, keyword: str):
         profanity_keywords = self.config.get("profanity_keywords", [])
         
@@ -995,7 +1048,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["profanity_keywords"] = profanity_keywords
         yield event.plain_result(f"[成功] 已删除关键词 '{keyword}'\n当前关键词数量: {len(profanity_keywords)}")
 
-    @filter.command("查看骂人关键词")
+@filter.command("查看骂人关键词")
     async def list_profanity_keywords(self, event: AstrMessageEvent):
         profanity_keywords = self.config.get("profanity_keywords", [])
         
@@ -1006,7 +1059,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         keywords_list = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(profanity_keywords)])
         yield event.plain_result(f"当前骂人关键词列表 ({len(profanity_keywords)}个):\n{keywords_list}")
 
-    @filter.command("切换骂人检测模式")
+@filter.command("切换骂人检测模式")
     async def toggle_profanity_mode(self, event: AstrMessageEvent):
         profanity_use_ai = self.config.get("profanity_use_ai", True)
         
@@ -1016,7 +1069,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         mode = "AI检测" if profanity_use_ai else "关键词检测"
         yield event.plain_result(f"[成功] 已切换为 {mode} 模式")
 
-    @filter.command("添加白名单用户")
+@filter.command("添加白名单用户")
     async def add_whitelist_user(self, event: AstrMessageEvent, user_id: str):
         whitelist_users = self.config.get("whitelist_users", [])
         
@@ -1028,7 +1081,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["whitelist_users"] = whitelist_users
         yield event.plain_result(f"[成功] 已添加用户 {user_id} 到白名单\n当前白名单人数: {len(whitelist_users)}")
 
-    @filter.command("删除白名单用户")
+@filter.command("删除白名单用户")
     async def remove_whitelist_user(self, event: AstrMessageEvent, user_id: str):
         whitelist_users = self.config.get("whitelist_users", [])
         
@@ -1040,7 +1093,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["whitelist_users"] = whitelist_users
         yield event.plain_result(f"[成功] 已从白名单移除用户 {user_id}\n当前白名单人数: {len(whitelist_users)}")
 
-    @filter.command("查看白名单")
+@filter.command("查看白名单")
     async def list_whitelist(self, event: AstrMessageEvent):
         whitelist_users = self.config.get("whitelist_users", [])
         
@@ -1051,18 +1104,12 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         users_list = "\n".join([f"{i+1}. {uid}" for i, uid in enumerate(whitelist_users)])
         yield event.plain_result(f"当前白名单用户 ({len(whitelist_users)}人):\n{users_list}")
 
-    @filter.command("查看违规统计")
+@filter.command("查看违规统计")
     async def view_violation_stats(self, event: AstrMessageEvent, user_id: str = ""):
         if user_id:
             stats = self.violation_stats.get(user_id, {"image": 0, "spam": 0, "profanity": 0, "ad": 0, "link": 0})
             total = sum(stats.values())
-            stats_info = f"""用户 {user_id} 违规统计:
-图片违规: {stats['image']} 次
-刷屏: {stats['spam']} 次
-骂人: {stats['profanity']} 次
-广告: {stats['ad']} 次
-链接: {stats['link']} 次
-总计: {total} 次"""
+            stats_info = f"""用户 {user_id} 违规统计: 图片违规: {stats['image']} 次 刷屏: {stats['spam']} 次 骂人: {stats['profanity']} 次 广告: {stats['ad']} 次 链接: {stats['link']} 次 总计: {total} 次"""
             yield event.plain_result(stats_info)
         else:
             total_users = len(self.violation_stats)
@@ -1073,7 +1120,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
             total_violations = sum(sum(stats.values()) for stats in self.violation_stats.values())
             yield event.plain_result(f"违规统计概览:\n违规用户数: {total_users} 人\n总违规次数: {total_violations} 次")
 
-    @filter.command("设置广告禁言时长")
+@filter.command("设置广告禁言时长")
     async def set_ad_ban_duration(self, event: AstrMessageEvent, seconds: int):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
@@ -1082,7 +1129,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["ad_ban_duration"] = seconds
         yield event.plain_result(f"[成功] 广告禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置链接禁言时长")
+@filter.command("设置链接禁言时长")
     async def set_link_ban_duration(self, event: AstrMessageEvent, seconds: int):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
@@ -1091,7 +1138,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["link_ban_duration"] = seconds
         yield event.plain_result(f"[成功] 链接禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("添加广告关键词")
+@filter.command("添加广告关键词")
     async def add_ad_keyword(self, event: AstrMessageEvent, keyword: str):
         ad_keywords = self.config.get("ad_keywords", [])
         
@@ -1103,7 +1150,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["ad_keywords"] = ad_keywords
         yield event.plain_result(f"[成功] 已添加广告关键词 '{keyword}'\n当前关键词数量: {len(ad_keywords)}")
 
-    @filter.command("删除广告关键词")
+@filter.command("删除广告关键词")
     async def remove_ad_keyword(self, event: AstrMessageEvent, keyword: str):
         ad_keywords = self.config.get("ad_keywords", [])
         
@@ -1115,7 +1162,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         self.config["ad_keywords"] = ad_keywords
         yield event.plain_result(f"[成功] 已删除广告关键词 '{keyword}'\n当前关键词数量: {len(ad_keywords)}")
 
-    @filter.command("查看广告关键词")
+@filter.command("查看广告关键词")
     async def list_ad_keywords(self, event: AstrMessageEvent):
         ad_keywords = self.config.get("ad_keywords", [])
         
@@ -1127,7 +1174,7 @@ API Key: {'已配置' if self.config.get('api_key') else '未配置'}
         more = f"\n... 还有 {len(ad_keywords) - 20} 个" if len(ad_keywords) > 20 else ""
         yield event.plain_result(f"当前广告关键词列表 ({len(ad_keywords)}个):\n{keywords_list}{more}")
 
-    @filter.command("设置群号推广禁言时长")
+@filter.command("设置群号推广禁言时长")
     async def set_group_promotion_ban_duration(self, event: AstrMessageEvent, seconds: int):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
