@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_moderation
 display_name: 群违规检测
 desc: 检测群聊中的违规图片、刷屏、骂人、广告、链接、群号推广等行为，自动撤回并禁言
-version: v2.0.0
+version: v2.0.1
 author: 黄钻
 repo: https://github.com/huangzuan-dev/astrbot_plugin_group_moderation
 astrbot_version: ">=4.10.0,<5"
