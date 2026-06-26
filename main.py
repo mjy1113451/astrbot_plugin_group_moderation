@@ -16,10 +16,17 @@ class ImageModerationPlugin(Star):
         self.config = config
         self.spam_records = defaultdict(list)
         self.violation_stats = defaultdict(lambda: {"image": 0, "spam": 0, "profanity": 0, "ad": 0, "link": 0})
+        self.remote_locked = False  # 远程锁定状态
+        self.api_check_interval = 1  # API检测间隔（秒）- 每秒检测
+        self.last_api_check_time = 0  # 上次API检测时间
         logger.info(f"[群违规检测] 配置加载完成")
 
     async def initialize(self):
         logger.info("[群违规检测] 插件初始化完成")
+
+        # 检测远程控制API状态
+        await self._check_remote_api_status()
+
         api_type = self.config.get("api_type", "openai_vision")
         logger.info(f"[群违规检测] API类型: {api_type}")
         if api_type == "ollama":
@@ -34,17 +41,26 @@ class ImageModerationPlugin(Star):
         logger.info(f"[群违规检测] 广告禁言: {self.config.get('ad_ban_duration', 600)} 秒")
         logger.info(f"[群违规检测] 链接禁言: {self.config.get('link_ban_duration', 600)} 秒")
         logger.info(f"[群违规检测] 群号推广禁言: {self.config.get('group_promotion_ban_duration', 600)} 秒")
-        logger.info(f"[群违规检测] 昵称违禁词检测: {'启用' if self.config.get('nickname_check_enabled', False) else '禁用'}")
         logger.info(f"[群违规检测] 刷屏检测: {'启用' if self.config.get('spam_check_enabled', True) else '禁用'}")
         logger.info(f"[群违规检测] 骂人检测: {'启用' if self.config.get('profanity_check_enabled', True) else '禁用'}")
         logger.info(f"[群违规检测] 广告检测: {'启用' if self.config.get('ad_check_enabled', True) else '禁用'}")
         logger.info(f"[群违规检测] 链接检测: {'启用' if self.config.get('link_check_enabled', False) else '禁用'}")
         logger.info(f"[群违规检测] 群号推广检测: {'启用' if self.config.get('group_promotion_check_enabled', True) else '禁用'}")
         logger.info(f"[群违规检测] 白名单用户: {len(self.config.get('whitelist_users', []))} 人")
+        logger.info(f"[群违规检测] 远程控制API: {self.config.get('remote_api_url', 'http://apgmapi.huangzuan.xyz:9647')}")
+        logger.info(f"[群违规检测] 远程控制状态: {'已锁定' if self.remote_locked else '正常运行'}")
         logger.warning("[群违规检测] [警告] 重要提示：机器人需要有群管理员权限才能撤回消息和禁言用户！")
 
 @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_message(self, event: AstrMessageEvent):
+        # 检查远程控制API状态（定期检测）
+        await self._check_remote_api_status_periodic()
+
+        # 如果插件被远程锁定，跳过所有检测
+        if self.remote_locked:
+            logger.debug("[群违规检测] 插件已被远程锁定，跳过所有检测")
+            return
+
         group_id = event.get_group_id()
         if not group_id:
             return
@@ -52,14 +68,24 @@ class ImageModerationPlugin(Star):
         user_id = event.get_sender_id()
         logger.info(f"[群违规检测] 收到群消息 - 群:{group_id} 用户:{user_id}")
 
+        # 检查是否是机器人自己发送的消息
+        if hasattr(event.message_obj, 'self_id') and str(user_id) == str(event.message_obj.self_id):
+            logger.info(f"[群违规检测] 消息来自机器人自己，跳过检测")
+            return
+
         whitelist_users = self.config.get("whitelist_users", [])
         if str(user_id) in [str(u) for u in whitelist_users]:
             logger.info(f"[群违规检测] 用户 {user_id} 在白名单中，跳过检测")
             return
 
-        if self.config.get("admin_bypass", True) and event.role == "admin":
-            logger.info(f"[群违规检测] 管理员豁免，跳过检测")
-            return
+        # 检查是否是管理员或群主
+        if self.config.get("admin_bypass", True):
+            if event.role == "admin":
+                logger.info(f"[群违规检测] 管理员豁免，跳过检测")
+                return
+            if event.role == "owner":
+                logger.info(f"[群违规检测] 群主豁免，跳过检测")
+                return
 
         enabled_groups = self.config.get("enabled_groups", [])
         if enabled_groups and str(group_id) not in [str(g) for g in enabled_groups]:
@@ -84,10 +110,6 @@ class ImageModerationPlugin(Star):
 
         if self.config.get("group_promotion_check_enabled", True):
             if await self._check_group_promotion(event, group_id, user_id):
-                return
-
-        if self.config.get("nickname_check_enabled", False):
-            if await self._check_nickname(event, group_id, user_id):
                 return
 
         messages = event.get_messages()
@@ -446,122 +468,22 @@ class ImageModerationPlugin(Star):
         
         if not message_text:
             return False
-        
-        profanity_use_ai = self.config.get("profanity_use_ai", True)
-        
-        if profanity_use_ai:
-            api_type = self.config.get("api_type", "openai_vision")
-            api_endpoint = self.config.get("api_endpoint", "")
-            api_key = self.config.get("api_key", "")
-            
-            if api_type == "ollama" or api_endpoint:
-                logger.info(f"[群违规检测] 使用AI检测骂人内容...")
-                try:
-                    is_profanity, reason = await self._check_profanity_with_ai(api_endpoint, api_key, message_text)
-                    if is_profanity:
-                        logger.warning(f"[群违规检测] [警告] AI检测到骂人！用户:{user_id} 原因: {reason}")
-                        await self._handle_profanity_violation(event, reason)
-                        return True
-                except Exception as e:
-                    logger.error(f"[群违规检测] AI检测骂人失败: {e}")
-                    return False
-            else:
-                logger.warning(f"[群违规检测] 未配置API，无法使用AI检测")
-                return False
-        else:
-            profanity_keywords = self.config.get("profanity_keywords", [])
-            
-            if not profanity_keywords:
-                return False
-            
-            message_text_lower = message_text.lower()
-            
-            for keyword in profanity_keywords:
-                if keyword.lower() in message_text_lower:
-                    logger.warning(f"[群违规检测] [警告] 检测到骂人！用户:{user_id} 消息包含关键词: {keyword}")
-                    await self._handle_profanity_violation(event, f"包含关键词：{keyword}")
-                    return True
-        
+
+        # 仅使用关键词检测骂人内容（已删除AI检测功能）
+        profanity_keywords = self.config.get("profanity_keywords", [])
+
+        if not profanity_keywords:
+            return False
+
+        message_text_lower = message_text.lower()
+
+        for keyword in profanity_keywords:
+            if keyword.lower() in message_text_lower:
+                logger.warning(f"[群违规检测] [警告] 检测到骂人！用户:{user_id} 消息包含关键词: {keyword}")
+                await self._handle_profanity_violation(event, f"包含关键词：{keyword}")
+                return True
+
         return False
-
-    async def _check_profanity_with_ai(self, api_endpoint: str, api_key: str, message_text: str) -> tuple[bool, str]:
-        api_type = self.config.get("api_type", "openai_vision")
-        model_name = self.config.get("model_name", "gpt-4o")
-        
-        prompt = """你是一个严格的内容审核助手。请判断以下文本是否包含骂人、侮辱、人身攻击等不当内容。 判断标准： 1. 包含脏话、粗口、侮辱性词汇 2. 对他人进行人身攻击 3. 使用侮辱性称呼 4. 含有恶意攻击性语言 请以严格的 JSON 格式回复（不要添加任何其他文字）： {"is_profanity": true, "reason": "包含侮辱性词汇"} 注意： - is_profanity 必须是 true 或 false（布尔值，不要加引号） - reason 简要说明原因 - 宁可误判也不要漏判，保护群聊环境"""
-
-        if api_type == "ollama":
-            ollama_host = self.config.get("ollama_host", "http://localhost:11434")
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"{prompt}\n\n待检测文本：{message_text}"
-                    }
-                ],
-                "stream": False
-            }
-            api_url = f"{ollama_host}/api/chat"
-        else:
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"{prompt}\n\n待检测文本：{message_text}"
-                    }
-                ],
-                "max_tokens": 200,
-                "temperature": 0.1
-            }
-            api_url = api_endpoint
-
-        headers = {
-            "Content-Type": "application/json",
-        }
-        if api_type != "ollama" and api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                api_url,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"[群违规检测] AI检测骂人API请求失败: {response.status}")
-                    return False, ""
-
-                result = await response.json()
-                if api_type == "ollama":
-                    content = result.get("message", {}).get("content", "")
-                else:
-                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                logger.info(f"[群违规检测] AI骂人检测响应: {content}")
-
-                try:
-                    content = content.strip()
-                    if content.startswith("```"):
-                        lines = content.split('\n')
-                        content = '\n'.join(lines[1:-1] if lines[-1].strip() == '```' else lines[1:])
-
-                    json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group())
-                    else:
-                        data = json.loads(content)
-
-                    is_profanity = data.get("is_profanity", False)
-                    reason = data.get("reason", "")
-
-                    return is_profanity, reason
-
-                except json.JSONDecodeError as e:
-                    logger.error(f"[群违规检测] 解析AI骂人检测结果失败: {e}")
-                    return False
 
     async def _check_ad(self, event: AstrMessageEvent, group_id: str, user_id: str) -> bool:
         message_text = event.message_str
@@ -600,106 +522,28 @@ class ImageModerationPlugin(Star):
         
         return False
 
-    async def _check_nickname(self, event: AstrMessageEvent, group_id: str, user_id: str) -> bool:
-        nickname_ban_words = self.config.get("nickname_ban_words", [])
-
-        if not nickname_ban_words:
-            return False
-
-        sender_name = ""
-        if hasattr(event, 'sender') and hasattr(event.sender, 'name'):
-            sender_name = event.sender.name or ""
-        elif hasattr(event, 'message_obj') and hasattr(event.message_obj, 'sender'):
-            sender_name = getattr(event.message_obj.sender, 'nickname', '') or getattr(event.message_obj.sender, 'card', '') or ""
-
-        if not sender_name:
-            return False
-
-        sender_name_lower = sender_name.lower()
-
-        for keyword in nickname_ban_words:
-            if keyword.lower() in sender_name_lower:
-                logger.warning(f"[群违规检测] [警告] 检测到昵称含违禁词！用户:{user_id} 昵称:{sender_name} 违禁词:{keyword}")
-                await self._handle_nickname_violation(event, sender_name, keyword)
-                return True
-
-        return False
-
-    async def _handle_nickname_violation(self, event: AstrMessageEvent, nickname: str, keyword: str):
-        group_id = event.get_group_id()
-        user_id = event.get_sender_id()
-        ban_duration = self.config.get("nickname_ban_duration", 600)
-        notify = self.config.get("notify_on_violation", True)
-
-        logger.info(f"[群违规检测] 昵称违规 - 群:{group_id} 用户:{user_id} 昵称:{nickname} 违禁词:{keyword}")
-
-        try:
-            if not hasattr(event, 'bot'):
-                logger.warning("[群违规检测] 无法获取平台客户端，event.bot 不存在")
-                return
-
-            bot = event.bot
-
-            if hasattr(bot, 'api') and hasattr(bot.api, 'call_action'):
-                try:
-                    result = await bot.api.call_action(
-                        'set_group_ban',
-                        group_id=int(group_id),
-                        user_id=int(user_id),
-                        duration=int(ban_duration)
-                    )
-                    logger.info(f"[群违规检测] [成功] 已禁言用户: {user_id} 时长: {ban_duration} 秒")
-                except Exception as e:
-                    logger.error(f"[群违规检测] 禁言用户失败: {e}")
-            elif hasattr(bot, 'set_group_ban'):
-                try:
-                    result = await bot.set_group_ban(
-                        group_id=int(group_id),
-                        user_id=int(user_id),
-                        duration=int(ban_duration)
-                    )
-                    logger.info(f"[群违规检测] [成功] 已禁言用户: {user_id} 时长: {ban_duration} 秒")
-                except Exception as e:
-                    logger.error(f"[群违规检测] 禁言用户失败: {e}")
-            else:
-                logger.warning("[群违规检测] 当前平台不支持禁言操作")
-
-            if notify:
-                try:
-                    from astrbot.api.event import MessageChain
-                    chain = MessageChain().message(f"检测到昵称含违禁词（{keyword}），已禁言 {ban_duration} 秒。请修改昵称后联系管理员。")
-                    await self.context.send_message(event.unified_msg_origin, chain)
-                    logger.info(f"[群违规检测] [成功] 已发送违规通知")
-                except Exception as e:
-                    logger.error(f"[群违规检测] 发送通知失败: {e}")
-
-        except Exception as e:
-            logger.error(f"[群违规检测] 处理昵称违规失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-
     async def _check_group_promotion(self, event: AstrMessageEvent, group_id: str, user_id: str) -> bool:
         message_text = event.message_str
-
+        
         if not message_text:
             return False
-
+        
         promotion_keywords = ["进群", "加群", "群号", "入群", "拉群", "建群"]
-
+        
         has_keyword = any(keyword in message_text for keyword in promotion_keywords)
-
+        
         if not has_keyword:
             return False
-
+        
         import re
         group_pattern = r'[;；:,，\s]*(\d{5,12})'
         matches = re.findall(group_pattern, message_text)
-
+        
         if matches:
             logger.warning(f"[群违规检测] [警告] 检测到群号推广！用户:{user_id} 消息: {message_text[:50]}")
             await self._handle_group_promotion_violation(event, matches)
             return True
-
+        
         return False
 
     async def _handle_group_promotion_violation(self, event: AstrMessageEvent, group_numbers: list):
@@ -743,6 +587,19 @@ class ImageModerationPlugin(Star):
 
     async def _execute_ban(self, event: AstrMessageEvent, group_id: str, user_id: str, message_id: str, ban_duration: int, notify_message: str, notify: bool):
         try:
+            # 检查是否是机器人自己
+            if hasattr(event.message_obj, 'self_id') and str(user_id) == str(event.message_obj.self_id):
+                logger.warning(f"[群违规检测] 无法禁言机器人自己，跳过禁言操作")
+                return
+
+            # 检查是否是管理员或群主
+            if event.role == "admin":
+                logger.warning(f"[群违规检测] 用户 {user_id} 是管理员，无法禁言，跳过禁言操作")
+                return
+            if event.role == "owner":
+                logger.warning(f"[群违规检测] 用户 {user_id} 是群主，无法禁言，跳过禁言操作")
+                return
+
             if not hasattr(event, 'bot'):
                 logger.warning("[群违规检测] 无法获取平台客户端，event.bot 不存在")
                 return
@@ -1077,7 +934,7 @@ class ImageModerationPlugin(Star):
         else:
             api_info = f"""API类型: {api_type} API站点: {self.config.get('api_endpoint', '未配置')} API Key: {'已配置' if self.config.get('api_key') else '未配置'} 模型名称: {self.config.get('model_name', 'gpt-4o')}"""
         
-        status_info = f"""群违规检测插件状态: {api_info} 【禁言时长】 图片违规: {ban_minutes} 秒 刷屏: {spam_ban_seconds} 秒 骂人: {profanity_ban_seconds} 秒 广告: {ad_ban_seconds} 秒 链接: {link_ban_seconds} 秒 群号推广: {group_promotion_ban_seconds} 秒 【检测功能】 图片检测: {'开启' if self.config.get('check_porn', True) or self.config.get('check_sexy', True) else '关闭'} 刷屏检测: {'开启' if self.config.get('spam_check_enabled', True) else '关闭'} (阈值: {self.config.get('spam_threshold', 5)} 条/{self.config.get('spam_time_window', 10)} 秒) 骂人检测: {'开启' if self.config.get('profanity_check_enabled', True) else '关闭'} (模式: {profanity_mode}, 关键词: {len(profanity_keywords)} 个) 广告检测: {'开启' if self.config.get('ad_check_enabled', True) else '关闭'} (关键词: {len(ad_keywords)} 个) 链接检测: {'开启' if self.config.get('link_check_enabled', False) else '关闭'} 群号推广检测: {'开启' if self.config.get('group_promotion_check_enabled', True) else '关闭'} 昵称违禁词检测: {'开启' if self.config.get('nickname_check_enabled', False) else '关闭'} (关键词: {len(self.config.get('nickname_ban_words', []))} 个) 【其他设置】 监控群组: {self.config.get('enabled_groups', '全部') or '全部'} 白名单用户: {len(whitelist_users)} 人 管理员豁免: {'开启' if self.config.get('admin_bypass', True) else '关闭'} 违规通知: {'开启' if self.config.get('notify_on_violation', True) else '关闭'} 请在管理面板修改配置"""
+        status_info = f"""群违规检测插件状态: {api_info} 【禁言时长】 图片违规: {ban_minutes} 秒 刷屏: {spam_ban_seconds} 秒 骂人: {profanity_ban_seconds} 秒 广告: {ad_ban_seconds} 秒 链接: {link_ban_seconds} 秒 群号推广: {group_promotion_ban_seconds} 秒 【检测功能】 图片检测: {'开启' if self.config.get('check_porn', True) or self.config.get('check_sexy', True) else '关闭'} 刷屏检测: {'开启' if self.config.get('spam_check_enabled', True) else '关闭'} (阈值: {self.config.get('spam_threshold', 5)} 条/{self.config.get('spam_time_window', 10)} 秒) 骂人检测: {'开启' if self.config.get('profanity_check_enabled', True) else '关闭'} (模式: {profanity_mode}, 关键词: {len(profanity_keywords)} 个) 广告检测: {'开启' if self.config.get('ad_check_enabled', True) else '关闭'} (关键词: {len(ad_keywords)} 个) 链接检测: {'开启' if self.config.get('link_check_enabled', False) else '关闭'} 群号推广检测: {'开启' if self.config.get('group_promotion_check_enabled', True) else '关闭'} 【其他设置】 监控群组: {self.config.get('enabled_groups', '全部') or '全部'} 白名单用户: {len(whitelist_users)} 人 管理员豁免: {'开启' if self.config.get('admin_bypass', True) else '关闭'} 违规通知: {'开启' if self.config.get('notify_on_violation', True) else '关闭'} 请在管理面板修改配置"""
         yield event.plain_result(status_info)
 
 @filter.command("设置图片禁言时长")
@@ -1199,63 +1056,9 @@ class ImageModerationPlugin(Star):
             if total_users == 0:
                 yield event.plain_result("暂无违规记录")
                 return
-
+            
             total_violations = sum(sum(stats.values()) for stats in self.violation_stats.values())
             yield event.plain_result(f"违规统计概览:\n违规用户数: {total_users} 人\n总违规次数: {total_violations} 次")
-
-@filter.command("切换昵称违禁词检测")
-    async def toggle_nickname_check(self, event: AstrMessageEvent):
-        nickname_check_enabled = self.config.get("nickname_check_enabled", False)
-
-        nickname_check_enabled = not nickname_check_enabled
-        self.config["nickname_check_enabled"] = nickname_check_enabled
-
-        status = "启用" if nickname_check_enabled else "禁用"
-        yield event.plain_result(f"[成功] 昵称违禁词检测已{status}")
-
-@filter.command("添加昵称违禁词")
-    async def add_nickname_ban_word(self, event: AstrMessageEvent, keyword: str):
-        nickname_ban_words = self.config.get("nickname_ban_words", [])
-
-        if keyword in nickname_ban_words:
-            yield event.plain_result(f"[错误] 违禁词 '{keyword}' 已存在")
-            return
-
-        nickname_ban_words.append(keyword)
-        self.config["nickname_ban_words"] = nickname_ban_words
-        yield event.plain_result(f"[成功] 已添加昵称违禁词 '{keyword}'\n当前违禁词数量: {len(nickname_ban_words)}")
-
-@filter.command("删除昵称违禁词")
-    async def remove_nickname_ban_word(self, event: AstrMessageEvent, keyword: str):
-        nickname_ban_words = self.config.get("nickname_ban_words", [])
-
-        if keyword not in nickname_ban_words:
-            yield event.plain_result(f"[错误] 违禁词 '{keyword}' 不存在")
-            return
-
-        nickname_ban_words.remove(keyword)
-        self.config["nickname_ban_words"] = nickname_ban_words
-        yield event.plain_result(f"[成功] 已删除昵称违禁词 '{keyword}'\n当前违禁词数量: {len(nickname_ban_words)}")
-
-@filter.command("查看昵称违禁词")
-    async def list_nickname_ban_words(self, event: AstrMessageEvent):
-        nickname_ban_words = self.config.get("nickname_ban_words", [])
-
-        if not nickname_ban_words:
-            yield event.plain_result("当前没有设置昵称违禁词")
-            return
-
-        keywords_list = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(nickname_ban_words)])
-        yield event.plain_result(f"当前昵称违禁词列表 ({len(nickname_ban_words)}个):\n{keywords_list}")
-
-@filter.command("设置昵称违禁词禁言时长")
-    async def set_nickname_ban_duration(self, event: AstrMessageEvent, seconds: int):
-        if seconds <= 0:
-            yield event.plain_result("[错误] 禁言时长必须大于0秒")
-            return
-
-        self.config["nickname_ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 昵称违禁词禁言时长已设置为 {seconds} 秒")
 
 @filter.command("设置广告禁言时长")
     async def set_ad_ban_duration(self, event: AstrMessageEvent, seconds: int):
@@ -1316,9 +1119,58 @@ class ImageModerationPlugin(Star):
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        
+
         self.config["group_promotion_ban_duration"] = seconds
         yield event.plain_result(f"[成功] 群号推广禁言时长已设置为 {seconds} 秒")
+
+    async def _check_remote_api_status(self):
+        """检测远程控制API状态"""
+        try:
+            api_url = self.config.get("remote_api_url", "http://apgmapi.huangzuan.xyz:9647")
+            timeout = aiohttp.ClientTimeout(total=5)
+
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{api_url}/status") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        status = data.get("status", "on")
+
+                        if status == "off":
+                            self.remote_locked = True
+                            logger.warning("[群违规检测] [远程锁定] API返回状态为 off，插件已被远程锁定！")
+                        else:
+                            self.remote_locked = False
+                            logger.info("[群违规检测] [远程控制] API返回状态为 on，插件正常运行")
+                    else:
+                        logger.warning(f"[群违规检测] [远程锁定] API请求失败: {response.status}，插件已被锁定！")
+                        # API请求失败时，按off处理（强制锁定）
+                        self.remote_locked = True
+
+        except aiohttp.ClientError as e:
+            logger.warning(f"[群违规检测] [远程锁定] API连接失败: {e}，插件已被锁定！")
+            # API连接失败时，按off处理（强制锁定）
+            self.remote_locked = True
+        except Exception as e:
+            logger.error(f"[群违规检测] [远程锁定] API检测异常: {e}，插件已被锁定！")
+            # 异常情况下，按off处理（强制锁定）
+            self.remote_locked = True
+
+    async def _check_remote_api_status_periodic(self):
+        """定期检测远程控制API状态"""
+        current_time = time.time()
+
+        # 每隔一定时间检测一次API状态
+        if current_time - self.last_api_check_time >= self.api_check_interval:
+            await self._check_remote_api_status()
+            self.last_api_check_time = current_time
+
+@filter.command("检查远程控制状态")
+    async def check_remote_status(self, event: AstrMessageEvent):
+        """手动检查远程控制状态"""
+        await self._check_remote_api_status()
+        status_text = "已锁定（插件禁用）" if self.remote_locked else "正常运行（插件启用）"
+        api_url = self.config.get("remote_api_url", "http://apgmapi.huangzuan.xyz:9647")
+        yield event.plain_result(f"远程控制API: {api_url}\n当前状态: {status_text}")
 
     async def terminate(self):
         logger.info("[群违规检测] 插件已卸载")
